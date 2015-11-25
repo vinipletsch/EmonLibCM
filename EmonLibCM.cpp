@@ -29,6 +29,8 @@
 
 #endif
 
+
+
 int cycles_per_second = 50; // mains frequency in Hz (i.e. 50 or 60)
 float datalog_period_in_seconds = 1.0;
 int min_startup_cycles = 10;
@@ -42,11 +44,14 @@ int no_of_channels = 4;
 // for general interaction between the main code and the ISR
 volatile boolean datalogEventPending;
 volatile boolean newMainsCycle = false; // provides a 50 Hz 'tick'
+unsigned long lastCycle = 0;     // provides a timeout mechamism
 
 int realPower_CT[max_no_of_channels];
+double Irms_CT[max_no_of_channels];
 long wh_CT[max_no_of_channels];
 
-int VrmsTimes100;
+bool EmonLibCM_ACAC;
+int EmonLibCM_Vrms;
     
 // analogue ports
 static const byte voltageSensor = 0;                // <-- used as an input
@@ -128,11 +133,13 @@ int datalogPeriodInMainsCycles;
 
 // accumulators & counters for use by the ISR
 long sumP_CT[max_no_of_channels];
+long sumI_CT[max_no_of_channels];
 long sum_Vsquared; // for Vrms datalogging   
 int samplesDuringThisDatalogPeriod;   
 
 // copies of ISR data for use by the main code
 volatile long copyOf_sumP_CT[max_no_of_channels]; 
+volatile long copyOf_sumI_CT[max_no_of_channels]; 
 volatile long copyOf_sum_Vsquared;
 volatile int copyOf_samplesDuringThisDatalogPeriod;
 
@@ -159,6 +166,7 @@ void EmonLibCM_number_of_channels(int _no_of_channels)
 void EmonLibCM_cycles_per_second(int _cycles_per_second)
 {
     cycles_per_second = _cycles_per_second;
+    datalogPeriodInMainsCycles = datalog_period_in_seconds * cycles_per_second;  
 }
 
 void EmonLibCM_min_startup_cycles(int _min_startup_cycles)
@@ -169,6 +177,7 @@ void EmonLibCM_min_startup_cycles(int _min_startup_cycles)
 void EmonLibCM_datalog_period(float _datalog_period_in_seconds)
 {
     datalog_period_in_seconds = _datalog_period_in_seconds;
+    datalogPeriodInMainsCycles = datalog_period_in_seconds * cycles_per_second;  
 }
 
 void EmonLibCM_voltageCal(double _voltageCal)
@@ -189,6 +198,11 @@ void EmonLibCM_phaseCal(int channel, double cal)
 int EmonLibCM_getRealPower(int channel)
 {
     return realPower_CT[channel];
+}
+
+double EmonLibCM_getIrms(int channel)
+{
+    return Irms_CT[channel];
 }
 
 int EmonLibCM_getWattHour(int channel)
@@ -228,6 +242,7 @@ void EmonLibCM_Init()
 void EmonLibCM_Start()
 {
     firstcycle = true;
+    lastCycle = millis();
     
     // Set up the ADC to be free-running 
     // 
@@ -263,6 +278,8 @@ void EmonLibCM_Start()
 
     ADCSRA |= (1<<ADSC);   // start ADC manually first time 
     sei();                 // Enable Global Interrupts
+    
+    
 }
 
 void EmonLibCM_Stop()
@@ -285,19 +302,24 @@ void EmonLibCM_StopInteral()
 void EmonLibCM_get_readings()
 {
     float powerNow;
+    float IrmsNow;
     float energyNow;
     int wattHoursRecent;
     
     for (int i=0; i<no_of_channels; i++) {
         powerNow = copyOf_sumP_CT[i] * powerCal_CT[i] / copyOf_samplesDuringThisDatalogPeriod;  // fp for accuracy
         realPower_CT[i] = powerNow + 0.5;                                                       // rounded down to nearest Watt
+        
+        IrmsNow = sqrt(copyOf_sumI_CT[i] / copyOf_samplesDuringThisDatalogPeriod) * currentCal[i];
+        Irms_CT[i] = IrmsNow;
+        
         energyNow = (powerNow * datalog_period_in_seconds) + residualEnergy_CT[i];              // fp for accuracy
         wattHoursRecent = energyNow / 3600;                                     // integer division to extract whole Wh
         wh_CT[i]+= wattHoursRecent;                                                             // accumulated WattHours since start-up
         residualEnergy_CT[i] = energyNow - (wattHoursRecent * 3600);            // fp for accuracy
     }
 
-    VrmsTimes100 = sqrt(copyOf_sum_Vsquared / copyOf_samplesDuringThisDatalogPeriod) * voltageCal;
+    EmonLibCM_Vrms = sqrt(copyOf_sum_Vsquared / copyOf_samplesDuringThisDatalogPeriod) * voltageCal;
 }
 
 bool EmonLibCM_Ready()
@@ -335,6 +357,7 @@ void EmonLibCM_confirmPolarity()
 
 void EmonLibCM_allGeneralProcessing_withinISR()
 {
+  if (stop) EmonLibCM_StopInteral();
   /* This routine dealts with activities that are only required at specific points
    * within each mains cycle.  It forms part of the ISR.
    */ 
@@ -350,13 +373,17 @@ void EmonLibCM_allGeneralProcessing_withinISR()
          * counters are then reset for use during the next period.
          */       
         cycleCountForDatalogging ++;
+        lastCycle = millis();
         
         // Used in stop start opperation, discards the first partial cycle
         if (cycleCountForDatalogging >= min_startup_cycles && firstcycle==true)
         {
             firstcycle = false;
             cycleCountForDatalogging = 0;
-            for (int i=0; i<no_of_channels; i++) sumP_CT[i] = 0;
+            for (int i=0; i<no_of_channels; i++) { 
+              sumP_CT[i] = 0;
+              sumI_CT[i] = 0;
+            }
             sum_Vsquared = 0;
             lowestNoOfSampleSetsPerMainsCycle = 999;
             samplesDuringThisDatalogPeriod = 0;
@@ -366,18 +393,26 @@ void EmonLibCM_allGeneralProcessing_withinISR()
         if (cycleCountForDatalogging  >= datalogPeriodInMainsCycles && firstcycle==false) 
         { 
           cycleCountForDatalogging = 0;    
-          for (int i=0; i<no_of_channels; i++) copyOf_sumP_CT[i] = sumP_CT[i]; 
+          for (int i=0; i<no_of_channels; i++) {
+            copyOf_sumP_CT[i] = sumP_CT[i]; 
+            copyOf_sumI_CT[i] = sumI_CT[i]; 
+          }
           copyOf_sum_Vsquared = sum_Vsquared;
           copyOf_samplesDuringThisDatalogPeriod = samplesDuringThisDatalogPeriod;
           copyOf_lowestNoOfSampleSetsPerMainsCycle = lowestNoOfSampleSetsPerMainsCycle; // (for diags only)
-          for (int i=0; i<no_of_channels; i++) sumP_CT[i] = 0;
+          for (int i=0; i<no_of_channels; i++) {
+            sumP_CT[i] = 0;
+            sumI_CT[i] = 0;
+          }
           sum_Vsquared = 0;
           lowestNoOfSampleSetsPerMainsCycle = 999;
           samplesDuringThisDatalogPeriod = 0;
+          
+          EmonLibCM_ACAC = true;
           datalogEventPending = true;
           
           // Stops the sampling at the end of the cycle if EmonLibCM_Stop() has been called
-          if (stop) EmonLibCM_StopInteral();
+          // if (stop) EmonLibCM_StopInteral();
         }
       } // end of processing that is specific to the first Vsample in each +ve half cycle   
   } // end of processing that is specific to samples where the voltage is positive
@@ -410,6 +445,40 @@ void EmonLibCM_allGeneralProcessing_withinISR()
                 
     } // end of processing that is specific to the first Vsample in each -ve half cycle
   } // end of processing that is specific to samples where the voltage is positive
+  
+  // In the case where the voltage signal is missing this part counts the missing cycles
+  // up to the duration of the datalog period at which point it will make the rms current      
+  // readings available for CT only mode.
+  
+  unsigned long missing_cycles = (millis() - lastCycle) / (1000 / cycles_per_second);
+  
+  if (missing_cycles > datalogPeriodInMainsCycles) {
+    lastCycle = millis(); // reset the lastCycle count here.
+    firstcycle = true;    // firstcycle reset to true so that next reading
+                          // with voltage signal starts from the right place
+                          
+          cycleCountForDatalogging = 0;    
+          for (int i=0; i<no_of_channels; i++) {
+            copyOf_sumP_CT[i] = 0;
+            copyOf_sumI_CT[i] = sumI_CT[i]; 
+          }
+          copyOf_sum_Vsquared = sum_Vsquared;
+          copyOf_samplesDuringThisDatalogPeriod = samplesDuringThisDatalogPeriod;
+          copyOf_lowestNoOfSampleSetsPerMainsCycle = lowestNoOfSampleSetsPerMainsCycle; // (for diags only)
+          for (int i=0; i<no_of_channels; i++) {
+            sumP_CT[i] = 0;
+            sumI_CT[i] = 0;
+          }
+          sum_Vsquared = 0;
+          lowestNoOfSampleSetsPerMainsCycle = 999;
+          samplesDuringThisDatalogPeriod = 0;
+          
+          EmonLibCM_ACAC = false;
+          datalogEventPending = true;
+          
+          // Stops the sampling at the end of the cycle if EmonLibCM_Stop() has been called
+          // if (stop) EmonLibCM_StopInteral();                
+  }
 }
 // end of allGeneralProcessing()
 
@@ -436,6 +505,7 @@ void EmonLibCM_interrupt()
   long filtI_div4;
   long instP;
   long inst_Vsquared;
+  long inst_Isquared;
   long sampleIminusDC_long;
   long phaseShiftedSampleV_minusDC_long;
   
@@ -478,6 +548,7 @@ void EmonLibCM_interrupt()
   
   if (sample_index>=1 && sample_index <= no_of_channels)
   {
+      if (rawSample>10) {
       // remove most of the DC offset from the current sample (the precise value does not matter)
       sampleIminusDC_long = ((long)(rawSample - DCoffset_I))<<8;
       
@@ -492,8 +563,13 @@ void EmonLibCM_interrupt()
       instP = filtV_div4 * filtI_div4;  // 32-bits (now x4096, or 2^12)
       instP = instP>>12;     // scaling is now x1, as for Mk2 (V_ADC x I_ADC)  
       
+      inst_Isquared = filtI_div4 * filtI_div4;
+      inst_Isquared = inst_Isquared>>12;
+      sumI_CT[sample_index-1] += inst_Isquared;
+      
       // if (sample_CT4==0) instP_CT4 = 0;  
       sumP_CT[sample_index-1] +=instP; // cumulative power, scaling as for Mk2 (V_ADC x I_ADC)
+      }
   }
   
   sample_index++; // advance the control flag

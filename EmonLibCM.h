@@ -40,6 +40,7 @@ void EmonLibCM_currentCal(int channel, double cal);
 void EmonLibCM_phaseCal(int channel, double cal);
 
 int EmonLibCM_getRealPower(int channel);
+double EmonLibCM_getIrms(int channel);
 int EmonLibCM_getWattHour(int channel);
 
 void EmonLibCM_Init();
@@ -52,6 +53,8 @@ bool EmonLibCM_Ready();
 // for general interaction between the main code and the ISR
 extern volatile boolean datalogEventPending;
 
-extern int VrmsTimes100;
+extern bool EmonLibCM_ACAC;
+
+extern int EmonLibCM_Vrms;
 
 #endif
